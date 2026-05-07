@@ -40,12 +40,20 @@ CONCURRENT_WRITEBACK_BLOCK_QUOTA = 2
 # loadback's source pages can be evicted and reused by a writeback in a later
 # plan, corrupting both transfers. Until the scheduler holds the HostNodeRef
 # through loadback completion (mirroring WritingBack), serializing the load
-# and write streams across flush() boundaries closes the window. Set
-# TOKENSPEED_SERIALIZE_HOST_TRANSFER=1 to enable; remove once the scheduler
-# fix lands.
-_SERIALIZE_HOST_TRANSFER = os.environ.get(
-    "TOKENSPEED_SERIALIZE_HOST_TRANSFER", "0"
-) not in ("0", "", "false", "False")
+# and write streams across flush() boundaries closes the window.
+#
+# TOKENSPEED_SERIALIZE_HOST_TRANSFER:
+#   "0" / unset (default) — no serialization
+#   "1"                   — load_stream <-> write_stream serialized at flush
+#   "full"                — additionally serialize against execution_stream
+#                           (debug hammer: kills all overlap, used to bisect
+#                           whether the remaining race is in cache transfers
+#                           or somewhere else).
+_HOST_TRANSFER_SERIAL_MODE = (
+    os.environ.get("TOKENSPEED_SERIALIZE_HOST_TRANSFER", "0").strip().lower()
+)
+SERIALIZE_HOST_TRANSFER = _HOST_TRANSFER_SERIAL_MODE in ("1", "true", "full")
+SERIALIZE_HOST_TRANSFER_FULL = _HOST_TRANSFER_SERIAL_MODE == "full"
 
 
 def _cache_stream_priorities() -> tuple[int | None, int | None]:
@@ -283,7 +291,7 @@ class HostExecutor:
         previous_writeback_block_quota = getattr(self, "_writeback_block_quota", None)
         self._writeback_block_quota = writeback_block_quota
         try:
-            if _SERIALIZE_HOST_TRANSFER:
+            if SERIALIZE_HOST_TRANSFER:
                 # Cross-stream barrier at the flush boundary: load and write
                 # streams must not overlap across plans, since the scheduler
                 # may evict an in-flight loadback's host pages and reuse them

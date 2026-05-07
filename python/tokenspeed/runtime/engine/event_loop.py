@@ -30,6 +30,9 @@ import torch.distributed as dist
 import zmq
 from tokenspeed_scheduler import PD, Cache, ExecutionEvent, Scheduler
 
+from tokenspeed.runtime.cache.executor.host_executor import (
+    SERIALIZE_HOST_TRANSFER_FULL,
+)
 from tokenspeed.runtime.cache.executor.memory_executor import (
     MemoryExecutor,
     MemoryExecutorConfig,
@@ -528,6 +531,15 @@ class EventLoop:
     def _submit_cache_ops(self, execution_plan) -> None:
         if self.memory_executor is None:
             return
+        if SERIALIZE_HOST_TRANSFER_FULL:
+            # Debug hammer: before issuing new transfers, make load/write
+            # streams wait on execution_stream so cache ops never overlap
+            # with prior compute. Combined with the post-flush fence in
+            # _setup_layerwise_loadback, this serializes load/write/exec.
+            host_exec = getattr(self.memory_executor, "host_exec", None)
+            if host_exec is not None:
+                host_exec.write_stream.wait_stream(self.model_executor.execution_stream)
+                host_exec.load_stream.wait_stream(self.model_executor.execution_stream)
         self.memory_executor.submit_plan(execution_plan)
         for op in execution_plan.cache:
             if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
@@ -569,6 +581,11 @@ class EventLoop:
         host_exec = getattr(self.memory_executor, "host_exec", None)
         if host_exec is not None:
             self.model_executor.execution_stream.wait_stream(host_exec.write_stream)
+            if SERIALIZE_HOST_TRANSFER_FULL:
+                # Debug hammer: also wait on load_stream so compute can't run
+                # until this plan's H2D loadbacks fully complete (bypasses the
+                # layerwise consumer mechanism — kills overlap on purpose).
+                self.model_executor.execution_stream.wait_stream(host_exec.load_stream)
 
     # ------------------------------------------------------------------
     # Helpers
