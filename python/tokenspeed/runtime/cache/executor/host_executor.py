@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 from typing import Iterable, NamedTuple
 
@@ -33,6 +34,18 @@ from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 logger = get_colorful_logger(__name__)
 device_module = get_device_module()
 CONCURRENT_WRITEBACK_BLOCK_QUOTA = 2
+
+# Workaround for a scheduler-side race: ScheduleDecodeFromRetractedEvent does
+# not pin the matched host node past the FSM transition, so an in-flight H2D
+# loadback's source pages can be evicted and reused by a writeback in a later
+# plan, corrupting both transfers. Until the scheduler holds the HostNodeRef
+# through loadback completion (mirroring WritingBack), serializing the load
+# and write streams across flush() boundaries closes the window. Set
+# TOKENSPEED_SERIALIZE_HOST_TRANSFER=1 to enable; remove once the scheduler
+# fix lands.
+_SERIALIZE_HOST_TRANSFER = os.environ.get(
+    "TOKENSPEED_SERIALIZE_HOST_TRANSFER", "0"
+) not in ("0", "", "false", "False")
 
 
 def _cache_stream_priorities() -> tuple[int | None, int | None]:
@@ -270,6 +283,16 @@ class HostExecutor:
         previous_writeback_block_quota = getattr(self, "_writeback_block_quota", None)
         self._writeback_block_quota = writeback_block_quota
         try:
+            if _SERIALIZE_HOST_TRANSFER:
+                # Cross-stream barrier at the flush boundary: load and write
+                # streams must not overlap across plans, since the scheduler
+                # may evict an in-flight loadback's host pages and reuse them
+                # for a writeback (or vice versa). wait_stream is a one-shot
+                # sync against the other stream's currently-queued work, so
+                # transfers issued within this flush still parallelize against
+                # each other; only inter-flush overlap is lost.
+                self.write_stream.wait_stream(self.load_stream)
+                self.load_stream.wait_stream(self.write_stream)
             self._start_loading()
             self._start_writing()
         finally:
