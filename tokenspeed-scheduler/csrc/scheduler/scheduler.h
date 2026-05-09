@@ -116,9 +116,9 @@ private:
 private:
     PageAllocator device_allocator_;
     PageAllocator host_allocator_;
+    std::optional<MambaChunkAllocator> mamba_allocator_{};
     KVPrefixCache kv_prefix_cache_;
     ReqPoolAllocator req_pool_allocator_;
-    std::optional<MambaChunkAllocator> mamba_allocator_{};
     std::optional<HybridPrefixCache> hybrid_prefix_cache_{};
 
 private:

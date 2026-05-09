@@ -454,15 +454,7 @@ class CudaGraphWrapper:
                 #
                 # Note: drops the pre-refactor subtraction of
                 # `extend_prefix_lens` from `seq_lens` for the draft init.
-                self.draft_attn_backend.init_forward_metadata(
-                    padded_bs,
-                    padded_bs * self.max_tokens_per_req,
-                    req_pool_indices,
-                    seq_lens,
-                    req_to_page=self.drafter.req_to_page,
-                    forward_mode=forward_mode,
-                    **kwargs,
-                )
+
                 self.draft_attn_backend.init_forward_metadata(
                     padded_bs,
                     padded_bs,

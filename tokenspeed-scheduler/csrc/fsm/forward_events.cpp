@@ -287,7 +287,7 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
         // Mamba: insert the latest checkpoint snapshot at the terminal node.
         if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr &&
             (local_mamba_allocator->HasCheckpoint() || local_mamba_allocator->HasWorking())) {
-            MatchResult post_match = kv_prefix_cache_->Match(full_paged_tokens);
+            MatchResult post_match = kv_prefix_cache_->RawMatch(full_paged_tokens);
             TreeNode* terminal = post_match.device.last_node;
             if (terminal != nullptr && !terminal->HasMamba()) {
                 if (local_mamba_allocator->HasCheckpoint()) {
