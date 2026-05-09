@@ -38,10 +38,13 @@ class TreeNode;
 
 class KVPrefixCache {
 public:
-    KVPrefixCache(PageAllocator* device_allocator, PageAllocator* host_allocator, bool enable_l3_storage = false);
+    KVPrefixCache(PageAllocator* device_allocator, PageAllocator* host_allocator, bool enable_l3_storage = false,
+                  bool disable_prefix_cache = false);
 
     MatchResult Match(const token_vec_t& token_ids);
     MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages);
+    MatchResult RawMatch(const token_vec_t& token_ids);
+    MatchResult RawMatch(const std::vector<std::span<const std::int32_t>>& token_pages);
 
     template <ResourceType RType>
     InsertResult Insert(const token_vec_t& token_ids, const std::vector<std::int32_t>& prefix_pages,
@@ -72,6 +75,8 @@ public:
     DeviceManager& GetDeviceManager() { return device_; }
 
 private:
+    MatchResult RootMatch() const;
+
     template <ResourceType RType>
     void pruneEvicted(const std::vector<TreeNode*>& evicted);
 
@@ -89,6 +94,7 @@ private:
     HostManager host_;
     cache_op_id next_op_id_{1};
     bool enable_l3_storage_{false};
+    bool disable_prefix_cache_{false};
 };
 
 }  // namespace tokenspeed

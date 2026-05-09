@@ -147,7 +147,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
 std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFromRetracted(Request* request) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
 
-    MatchResult match_result = kv_prefix_cache_.Match(request->GetFullPagedTokens(true));
+    MatchResult match_result = kv_prefix_cache_.RawMatch(request->GetFullPagedTokens(true));
     std::vector<TreeNode*> loadback_diff = match_result.NodesWithout<ResourceType::Device>();
 
     const std::int32_t device_matched2 = match_result.device.DepthInPage();
@@ -189,7 +189,7 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
 
     kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages));
 
-    MatchResult match_result = kv_prefix_cache_.Match(full_paged_tokens);
+    MatchResult match_result = kv_prefix_cache_.RawMatch(full_paged_tokens);
 
     std::unique_ptr<HostNodeRef> temp_lock = std::make_unique<HostNodeRef>(match_result.host.last_node);
     const std::int32_t device_matched3 = match_result.device.DepthInPage();
