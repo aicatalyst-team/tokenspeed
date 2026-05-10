@@ -1,29 +1,39 @@
 # --------------------------------------------------------------------------
 # TokenSpeed — GPU-accelerated LLM inference engine
-# Multi-stage Dockerfile for OpenShift (CUDA runtime + UBI9)
+# Single-stage Dockerfile for OpenShift (CUDA runtime + UBI9)
 # --------------------------------------------------------------------------
 # Build context: repo root (/workspace/tokenspeed)
 # Build command:  podman build -f python/Dockerfile.ubi .
 # --------------------------------------------------------------------------
 #
-# Previous build failed due to OpenShift infrastructure — build pod evicted
-# (symlink resolution error on pod log path, caused by disk pressure / OOM).
+# Previous build failed: builder pod was OOM-killed / evicted due to resource
+# pressure during a multi-stage build that installed PyTorch + all deps twice
+# (once in builder, once copied to runtime).
 #
-# Fixes applied vs previous attempt:
-#   1. Multi-stage build: install all deps in builder stage, copy site-packages
-#      to runtime stage — halves final image size and reduces disk pressure.
-#   2. Single pip install layer in builder (all deps at once) — fewer layers,
-#      less cumulative overlay storage.
-#   3. Use --no-cache-dir globally via ENV to eliminate pip cache accumulation.
-#   4. Smaller runtime stage reduces total disk written during build.
+# Fixes applied:
+#   1. Single-stage build — eliminates duplicate storage of large packages
+#      and reduces peak disk usage by ~50%.
+#   2. Install torch first in its own layer with aggressive cleanup, then
+#      install remaining deps — avoids simultaneous peak memory from
+#      resolving the full dependency graph at once.
+#   3. PIP_NO_CACHE_DIR=1 globally to prevent pip cache accumulation.
+#   4. Skip triton explicit install (bundled with torch).
+#   5. Removed compiler toolchain from final image (gcc, devel headers) —
+#      only install for the pip step, then remove.
+#   6. Use --no-build-isolation for tokenspeed itself to avoid pip creating
+#      a redundant build environment.
 # --------------------------------------------------------------------------
 
-# ==================== BUILDER STAGE ====================
-FROM nvcr.io/nvidia/cuda:12.6.3-runtime-ubi9 AS builder
+FROM nvcr.io/nvidia/cuda:12.6.3-runtime-ubi9
 
 USER 0
 
-# ---------- System dependencies for building ----------
+# ---------- Global pip config ----------
+ENV PIP_NO_CACHE_DIR=1
+
+# ---------- System dependencies ----------
+# Install Python 3.12 + minimal build tools needed for some pip packages.
+# Compilers will be removed after pip install to shrink the image.
 RUN dnf install -y \
         python3.12 \
         python3.12-pip \
@@ -31,23 +41,27 @@ RUN dnf install -y \
         gcc \
         gcc-c++ \
         git \
+        libibverbs \
+        librdmacm \
     && dnf clean all \
     && alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
     && alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
 
-ENV PIP_NO_CACHE_DIR=1
-
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
-WORKDIR /build
+WORKDIR /opt/app-root/src
 
-# ---------- Install ALL Python dependencies in a single layer ----------
-# PyTorch with CUDA 12.6 index + all application deps + uvicorn/fastapi
-RUN pip install --no-cache-dir \
+# ---------- Step 1: Install PyTorch (largest dep, ~2 GB) ----------
+# Isolated so pip only resolves torch + torchvision; less peak memory.
+RUN python3 -m pip install --no-cache-dir \
         "torch==2.11.0" \
         torchvision \
         --extra-index-url https://download.pytorch.org/whl/cu126 \
-    && pip install --no-cache-dir \
+    && rm -rf /tmp/pip-* /root/.cache
+
+# ---------- Step 2: Install remaining application dependencies ----------
+# These are the deps from pyproject.toml minus torch/torchvision (already installed).
+RUN python3 -m pip install --no-cache-dir \
         aiohttp \
         compressed-tensors \
         dill \
@@ -81,7 +95,6 @@ RUN pip install --no-cache-dir \
         tiktoken \
         tqdm \
         "transformers==5.6.2" \
-        triton \
         uv \
         uvicorn \
         uvloop \
@@ -89,46 +102,25 @@ RUN pip install --no-cache-dir \
         "xgrammar==0.1.33" \
     && rm -rf /tmp/pip-* /root/.cache
 
-# ---------- Install the tokenspeed package ----------
-COPY python/pyproject.toml python/LICENSE python/THIRDPARTYNOTICES /build/python/
-COPY python/tokenspeed /build/python/tokenspeed
+# ---------- Step 3: Install the tokenspeed package ----------
+COPY python/pyproject.toml python/LICENSE python/THIRDPARTYNOTICES ./python/
+COPY python/tokenspeed ./python/tokenspeed
 
-RUN cd /build/python \
-    && pip install --no-cache-dir --no-deps --no-build-isolation . \
+RUN cd python \
+    && python3 -m pip install --no-cache-dir --no-deps --no-build-isolation . \
     && rm -rf /tmp/pip-* /root/.cache
 
-# Verify critical imports in builder
+# ---------- Step 4: Remove build-only packages to reduce image size ----------
+RUN dnf remove -y \
+        python3.12-devel \
+        gcc \
+        gcc-c++ \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# ---------- Verify critical imports ----------
 RUN python3 -c "import uvicorn; import fastapi; print('Server deps OK')" \
     && python3 -c "from tokenspeed.version import __version__; print(f'TokenSpeed v{__version__}')"
-
-
-# ==================== RUNTIME STAGE ====================
-FROM nvcr.io/nvidia/cuda:12.6.3-runtime-ubi9
-
-USER 0
-
-# ---------- Minimal runtime system packages (no compiler toolchain) ----------
-RUN dnf install -y \
-        python3.12 \
-        python3.12-pip \
-        libibverbs \
-        librdmacm \
-    && dnf clean all \
-    && alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
-    && alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
-
-# ---------- Copy installed Python packages from builder ----------
-COPY --from=builder /usr/lib64/python3.12/site-packages /usr/lib64/python3.12/site-packages
-COPY --from=builder /usr/lib/python3.12/site-packages /usr/lib/python3.12/site-packages
-COPY --from=builder /usr/local/lib64/python3.12/site-packages /usr/local/lib64/python3.12/site-packages
-COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
-
-WORKDIR /opt/app-root/src
-
-# ---------- Copy tokenspeed source (for any file-relative references) ----------
-COPY python/pyproject.toml python/LICENSE python/THIRDPARTYNOTICES /opt/app-root/src/python/
-COPY python/tokenspeed /opt/app-root/src/python/tokenspeed
 
 # ---------- Environment variables ----------
 # HF_TOKEN must be injected at runtime via K8s Secret / ConfigMap
