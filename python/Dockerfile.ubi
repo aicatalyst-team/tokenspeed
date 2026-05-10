@@ -1,0 +1,128 @@
+# --------------------------------------------------------------------------
+# TokenSpeed — GPU-accelerated LLM inference engine
+# Multi-stage Dockerfile for OpenShift (UBI / CUDA base)
+# --------------------------------------------------------------------------
+# Build context: repo root (/workspace/tokenspeed)
+# Build command:  docker build -f python/Dockerfile.ubi .
+# --------------------------------------------------------------------------
+
+# ============================================================
+# Stage 1: Builder — install all Python packages and compile
+#          CUDA kernels (requires devel toolkit + headers)
+# ============================================================
+FROM nvcr.io/nvidia/cuda:12.8.1-devel-ubi9 AS builder
+
+USER 0
+
+# System build tools required by native extensions
+RUN dnf install -y \
+        gcc gcc-c++ make cmake ninja-build \
+        python3.12 python3.12-pip python3.12-devel \
+        git \
+    && dnf clean all \
+    && alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
+
+# Ensure pip is up-to-date
+RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+WORKDIR /opt/app-root/src
+
+# ---- Install torch first (large, benefits from layer caching) ----
+RUN pip install --no-cache-dir "torch==2.11.0"
+
+# ---- Install tokenspeed-kernel (CUDA kernel sub-package) ----
+COPY tokenspeed-kernel/python /opt/app-root/src/tokenspeed-kernel/python
+
+ENV TOKENSPEED_KERNEL_BACKEND=cuda
+ENV CUDA_HOME=/usr/local/cuda
+ENV MAX_JOBS=4
+
+# Install kernel build requirements then the kernel package itself.
+# Some third-party CUDA extensions may fail — acceptable for PoC as long
+# as at least one attention backend works.
+RUN cd /opt/app-root/src/tokenspeed-kernel/python \
+    && pip install --no-cache-dir -r requirements/cuda.txt --no-build-isolation \
+    && pip install --no-cache-dir -e . --no-build-isolation \
+    || echo "WARNING: tokenspeed-kernel partial build — some CUDA extensions may be missing"
+
+# ---- Install tokenspeed-mla (optional Blackwell MLA kernels) ----
+COPY tokenspeed-mla /opt/app-root/src/tokenspeed-mla
+RUN pip install --no-cache-dir /opt/app-root/src/tokenspeed-mla --no-build-isolation \
+    || echo "WARNING: tokenspeed-mla install skipped (optional)"
+
+# ---- Install tokenspeed-scheduler (C++ scheduler with Python bindings) ----
+COPY tokenspeed-scheduler /opt/app-root/src/tokenspeed-scheduler
+RUN pip install --no-cache-dir /opt/app-root/src/tokenspeed-scheduler --no-build-isolation \
+    || echo "WARNING: tokenspeed-scheduler install skipped (optional)"
+
+# ---- Install the main tokenspeed Python package ----
+COPY python/pyproject.toml python/LICENSE python/THIRDPARTYNOTICES /opt/app-root/src/python/
+COPY python/tokenspeed /opt/app-root/src/python/tokenspeed
+
+RUN cd /opt/app-root/src/python \
+    && pip install --no-cache-dir -e . --no-build-isolation
+
+# Verify CLI is importable
+RUN python3 -c "from tokenspeed.version import __version__; print(f'TokenSpeed v{__version__}')"
+
+# ============================================================
+# Stage 2: Runtime — smaller image with only the CUDA runtime
+# ============================================================
+FROM nvcr.io/nvidia/cuda:12.8.1-runtime-ubi9
+
+USER 0
+
+# Runtime system dependencies
+RUN dnf install -y \
+        python3.12 python3.12-pip python3.12-devel \
+        libibverbs librdmacm \
+    && dnf clean all \
+    && alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
+
+WORKDIR /opt/app-root/src
+
+# Copy the full Python site-packages from builder
+COPY --from=builder /usr/local/lib/python3.12 /usr/local/lib/python3.12
+COPY --from=builder /usr/local/lib64/python3.12 /usr/local/lib64/python3.12
+COPY --from=builder /usr/lib/python3.12 /usr/lib/python3.12
+COPY --from=builder /usr/lib64/python3.12 /usr/lib64/python3.12
+
+# Copy editable installs (source trees referenced via .egg-link / .pth)
+COPY --from=builder /opt/app-root/src /opt/app-root/src
+
+# Copy pip-installed console scripts
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# ---------- Environment variables ----------
+# HF_TOKEN must be injected at runtime via K8s Secret / ConfigMap
+ENV HF_TOKEN=""
+ENV TOKENSPEED_MODEL=meta-llama/Llama-3.2-1B-Instruct
+ENV TOKENSPEED_HOST=0.0.0.0
+ENV TOKENSPEED_PORT=8000
+
+# HuggingFace cache — mount a PVC here for persistent model weights
+ENV HF_HOME=/opt/app-root/src/.cache/huggingface
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
+
+# CUDA runtime
+ENV CUDA_HOME=/usr/local/cuda
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# ---------- OpenShift compatibility ----------
+# Create writable cache directory; set group-0 permissions for arbitrary UID
+RUN mkdir -p /opt/app-root/src/.cache/huggingface \
+    && chgrp -R 0 /opt/app-root \
+    && chmod -R g=u /opt/app-root
+
+EXPOSE 8000
+
+USER 1001
+
+# Use shell form so environment variables are expanded at runtime
+CMD exec python3 -m tokenspeed.cli serve \
+    --model ${TOKENSPEED_MODEL} \
+    --host ${TOKENSPEED_HOST} \
+    --port ${TOKENSPEED_PORT}
