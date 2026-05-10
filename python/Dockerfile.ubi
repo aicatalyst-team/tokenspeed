@@ -6,14 +6,16 @@
 # Build command:  podman build -f python/Dockerfile.ubi .
 # --------------------------------------------------------------------------
 #
-# This build uses the CUDA *runtime* image (no devel toolkit) and installs
-# the core tokenspeed Python package only — no native C/CUDA kernel
-# extensions (tokenspeed-kernel, tokenspeed-mla, tokenspeed-scheduler).
-# The server starts with pure-Python / Triton attention backends.
+# Previous build failed due to infrastructure — build pod evicted (symlink
+# resolution error on pod log path, typically caused by OOM / disk pressure).
 #
-# Previous build fix: torch + all deps installed in a single layer caused
-# OOM during pip resolution/download. Now heavy packages are installed in
-# separate layers to cap peak memory and benefit from layer caching.
+# Fixes applied:
+#   1. Consolidated pip install into fewer, larger layers to reduce total
+#      number of intermediate layers and cumulative disk overhead.
+#   2. Combined torchvision install with other deps (was separate layer).
+#   3. Reduced total layer count from 7 pip layers → 2 pip layers.
+#   4. Added PIP_NO_CACHE_DIR=1 globally to prevent cache accumulation.
+#   5. Clean up pip temp/build artifacts after each install step.
 # --------------------------------------------------------------------------
 
 FROM nvcr.io/nvidia/cuda:12.6.3-runtime-ubi9
@@ -34,89 +36,76 @@ RUN dnf install -y \
     && alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
     && alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
 
-# Upgrade pip / setuptools — keep pip itself cached, it's tiny
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Ensure pip never writes cache (belt-and-suspenders with --no-cache-dir)
+ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /opt/app-root/src
 
-# ---------- Install heavy Python deps in isolated layers ----------
-# Each RUN is a separate layer so (a) peak memory per step is bounded
-# and (b) successfully installed layers are cached across rebuilds.
-
-# Layer 1 — PyTorch (≈3 GB CUDA wheels)
-# --extra-index-url keeps PyPI available for secondary deps (sympy, etc.)
+# ---------- Layer 1: PyTorch + torchvision (largest deps, ~3 GB) ----------
+# Isolated so this layer is cached across rebuilds of application code.
 RUN pip install --no-cache-dir \
         "torch==2.11.0" \
-        --extra-index-url https://download.pytorch.org/whl/cu126
+        torchvision \
+        --extra-index-url https://download.pytorch.org/whl/cu126 \
+    && rm -rf /tmp/pip-* /root/.cache
 
-# Layer 2 — torchvision (pulls further CUDA libs; install separately
-#           to avoid combining with the main dep resolution pass)
-RUN pip install --no-cache-dir torchvision \
-        --extra-index-url https://download.pytorch.org/whl/cu126
-
-# Layer 3 — transformers and its tokeniser dependency (tiktoken compiles
-#           C extensions, keep in its own layer)
+# ---------- Layer 2: All remaining Python dependencies ------------------
+# Single layer to minimise intermediate storage pressure.
 RUN pip install --no-cache-dir \
-        "transformers==5.6.2" \
-        tiktoken
-
-# Layer 4 — networking / server deps (lightweight)
-RUN pip install --no-cache-dir \
-        fastapi \
-        uvicorn \
-        uvloop \
         aiohttp \
-        python-multipart \
-        orjson \
-        msgspec \
-        pyzmq \
-        prometheus-client \
-        pydantic
-
-# Layer 5 — remaining non-trivial deps
-RUN pip install --no-cache-dir \
         compressed-tensors \
         dill \
         einops \
+        fastapi \
         hf_transfer \
         huggingface_hub \
         modelscope \
+        msgspec \
         ninja \
         numpy \
+        nvidia-cutlass-dsl \
+        nvtx \
         "openai==2.33.0" \
         openai-harmony \
+        orjson \
         packaging \
         partial-json-parser \
         peft \
         pillow \
+        prometheus-client \
         psutil \
         pybase64 \
         pybind11 \
+        pydantic \
         py-spy \
+        python-multipart \
+        pyzmq \
         requests \
         setproctitle \
+        tiktoken \
         tqdm \
+        "transformers==5.6.2" \
+        triton \
         uv \
-        viztracer
-
-# Layer 6 — CUDA-specific Python packages (may pull additional native libs)
-RUN pip install --no-cache-dir \
-        nvidia-cutlass-dsl \
-        nvtx \
+        uvicorn \
+        uvloop \
+        viztracer \
         "xgrammar==0.1.33" \
-        triton
+    && rm -rf /tmp/pip-* /root/.cache
 
 # ---------- Copy and install the tokenspeed package itself ----------
-# All heavy deps are already installed; this step only links the package.
 COPY python/pyproject.toml python/LICENSE python/THIRDPARTYNOTICES /opt/app-root/src/python/
 COPY python/tokenspeed /opt/app-root/src/python/tokenspeed
 
 RUN cd /opt/app-root/src/python \
-    && pip install --no-cache-dir --no-deps . --no-build-isolation
+    && pip install --no-cache-dir --no-deps --no-build-isolation . \
+    && rm -rf /tmp/pip-* /root/.cache
 
 # ---------- Verify key imports ----------
-RUN python3 -c "import uvicorn; import fastapi; print('Server deps OK')"
-RUN python3 -c "from tokenspeed.version import __version__; print(f'TokenSpeed v{__version__}')"
+RUN python3 -c "import uvicorn; import fastapi; print('Server deps OK')" \
+    && python3 -c "from tokenspeed.version import __version__; print(f'TokenSpeed v{__version__}')"
 
 # ---------- Environment variables ----------
 # HF_TOKEN must be injected at runtime via K8s Secret / ConfigMap
