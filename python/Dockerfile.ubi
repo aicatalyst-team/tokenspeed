@@ -6,16 +6,15 @@
 # Build command:  podman build -f python/Dockerfile.ubi .
 # --------------------------------------------------------------------------
 #
-# Previous build fix:
-#   - Prior single-stage build exhausted ephemeral storage / memory during
-#     build, causing OOMKill / pod eviction before logs could be captured.
-#   - Fix: Use multi-stage build. Builder installs everything into a venv,
-#     then only the venv + app code are copied to the slim runtime image.
-#   - Drop heavy optional deps not needed for core serving (torchvision,
-#     viztracer, py-spy, ninja, nvidia-cutlass-dsl, uv).
-#   - Use --no-build-isolation and pre-install build tools to avoid
-#     downloading setuptools/wheel repeatedly.
-#   - Single consolidated pip install to minimize layer bloat.
+# Build fix history:
+#   1. Original single-stage build exhausted disk during pip install.
+#   2. Multi-stage build still blew up because --extra-index-url caused pip
+#      to pull torch from PyPI, which bundles ~3 GB of nvidia-* CUDA libs
+#      that are ALREADY present in the CUDA base image.
+#   3. Fix: Use --index-url (not --extra-index-url) for torch to get the
+#      cu126 wheel that links against system CUDA and does NOT bundle
+#      nvidia-cublas, nvidia-cudnn, nvidia-nccl, etc.  Then install the
+#      remaining Python deps from PyPI in a separate pip call.
 # --------------------------------------------------------------------------
 
 # ========================  STAGE 1: Builder  ========================
@@ -38,8 +37,7 @@ RUN dnf install -y \
 RUN alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
     && alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
 
-# Create a virtual environment to isolate all installed packages —
-# this makes it easy to COPY the entire tree to the runtime stage.
+# Create a virtual environment for clean COPY to runtime stage
 ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv ${VIRTUAL_ENV}
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
@@ -47,14 +45,22 @@ ENV PIP_NO_CACHE_DIR=1
 
 RUN pip install --upgrade pip setuptools wheel
 
-# ---------- Install PyTorch (largest dep, ~2 GB) ----------
+# ---------- Install PyTorch from CUDA-specific index ----------
+# CRITICAL: Use --index-url (NOT --extra-index-url).
+# The cu126 index provides a torch wheel (~830 MB) that links against the
+# system CUDA libraries already present in the base image, instead of
+# bundling ~3 GB of nvidia-cublas-cu12, nvidia-cudnn-cu12, nvidia-nccl-cu12,
+# etc. as pip dependencies.  This is the key fix for the disk-space blow-up.
 RUN pip install --no-cache-dir \
         "torch==2.11.0" \
-        --extra-index-url https://download.pytorch.org/whl/cu126
+        --index-url https://download.pytorch.org/whl/cu126
 
-# ---------- Install remaining Python deps (excluding optional heavy ones) ----------
-# Omitting: torchvision, viztracer, py-spy, ninja, nvidia-cutlass-dsl, uv
-# These are not required for the core inference server to start.
+# ---------- Install triton separately (large wheel, own layer for caching) ----------
+RUN pip install --no-cache-dir triton
+
+# ---------- Install remaining Python deps from PyPI ----------
+# Omitting heavy optional packages not required for core serving:
+#   torchvision, viztracer, py-spy, ninja, nvidia-cutlass-dsl, uv
 RUN pip install --no-cache-dir \
         "transformers==5.6.2" \
         huggingface_hub \
@@ -128,6 +134,9 @@ ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 # Copy application source
 WORKDIR /opt/app-root/src
 COPY --from=builder /opt/app-root/src/python ./python
+
+# Ensure tokenspeed package is importable from WORKDIR/python
+ENV PYTHONPATH=/opt/app-root/src/python:${PYTHONPATH}
 
 # ---------- Light verification (no torch import — avoids CUDA init) ----------
 RUN python3 -c "import uvicorn; import fastapi; print('Server deps OK')" \
