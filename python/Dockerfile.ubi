@@ -1,28 +1,29 @@
 # --------------------------------------------------------------------------
 # TokenSpeed — GPU-accelerated LLM inference engine
-# Single-stage Dockerfile for OpenShift (CUDA runtime + UBI9)
+# Multi-stage Dockerfile for OpenShift (CUDA + UBI9)
 # --------------------------------------------------------------------------
 # Build context: repo root (/workspace/tokenspeed)
 # Build command:  podman build -f python/Dockerfile.ubi .
 # --------------------------------------------------------------------------
 #
 # Previous build fix:
-#   - The prior attempt installed all packages successfully but likely
-#     exhausted disk space across multiple large Docker layers. Each RUN
-#     layer persists intermediate pip/wheel artefacts even after cleanup.
-#   - Fix: Consolidate pip installs into fewer RUN steps, clean up
-#     aggressively within the SAME layer, and strip unnecessary files
-#     (tests, __pycache__, .dist-info) from installed packages.
-#   - Use correct cleanup paths for RHEL/UBI (/usr/lib64/python3.12).
-#   - Drop the heavy verification RUN step that imported torch (which
-#     writes CUDA lazy-init artefacts to disk).
+#   - Prior single-stage build exhausted ephemeral storage / memory during
+#     build, causing OOMKill / pod eviction before logs could be captured.
+#   - Fix: Use multi-stage build. Builder installs everything into a venv,
+#     then only the venv + app code are copied to the slim runtime image.
+#   - Drop heavy optional deps not needed for core serving (torchvision,
+#     viztracer, py-spy, ninja, nvidia-cutlass-dsl, uv).
+#   - Use --no-build-isolation and pre-install build tools to avoid
+#     downloading setuptools/wheel repeatedly.
+#   - Single consolidated pip install to minimize layer bloat.
 # --------------------------------------------------------------------------
 
-FROM nvcr.io/nvidia/cuda:12.6.3-runtime-ubi9
+# ========================  STAGE 1: Builder  ========================
+FROM nvcr.io/nvidia/cuda:12.6.3-devel-ubi9 AS builder
 
 USER 0
 
-# ---------- System packages (single layer) ----------
+# System build dependencies
 RUN dnf install -y \
         python3.12 \
         python3.12-pip \
@@ -30,32 +31,31 @@ RUN dnf install -y \
         gcc \
         gcc-c++ \
         git \
-        libibverbs \
-        librdmacm \
     && dnf clean all \
-    && rm -rf /var/cache/dnf /var/cache/yum \
-    && alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && rm -rf /var/cache/dnf /var/cache/yum
+
+# Set up python alternatives
+RUN alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
     && alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
 
-# Prevent pip from caching wheels/source — critical for keeping layers small
+# Create a virtual environment to isolate all installed packages —
+# this makes it easy to COPY the entire tree to the runtime stage.
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3 -m venv ${VIRTUAL_ENV}
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 ENV PIP_NO_CACHE_DIR=1
 
-RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && rm -rf /root/.cache /tmp/pip-*
+RUN pip install --upgrade pip setuptools wheel
 
-# ---------- Layer 1: PyTorch (largest single dep, ~2 GB) ----------
-# Isolated so other installs don't re-download if only app code changes.
-# Aggressively strip tests/data within the same layer.
-RUN python3 -m pip install --no-cache-dir \
+# ---------- Install PyTorch (largest dep, ~2 GB) ----------
+RUN pip install --no-cache-dir \
         "torch==2.11.0" \
-        --extra-index-url https://download.pytorch.org/whl/cu126 \
-    && find /usr -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
-    && find /usr -type d -name 'tests' -path '*/torch/*' -exec rm -rf {} + 2>/dev/null || true \
-    && rm -rf /root/.cache /tmp/pip-* /tmp/torch*
+        --extra-index-url https://download.pytorch.org/whl/cu126
 
-# ---------- Layer 2: All remaining Python dependencies ----------
-# Combined into a single layer to minimize total image size.
-RUN python3 -m pip install --no-cache-dir \
+# ---------- Install remaining Python deps (excluding optional heavy ones) ----------
+# Omitting: torchvision, viztracer, py-spy, ninja, nvidia-cutlass-dsl, uv
+# These are not required for the core inference server to start.
+RUN pip install --no-cache-dir \
         "transformers==5.6.2" \
         huggingface_hub \
         hf_transfer \
@@ -88,22 +88,48 @@ RUN python3 -m pip install --no-cache-dir \
         requests \
         setproctitle \
         tqdm \
-        "xgrammar==0.1.33" \
-    && find /usr -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
-    && rm -rf /root/.cache /tmp/pip-*
+        "xgrammar==0.1.33"
 
-# ---------- Install the tokenspeed package itself ----------
+# ---------- Install tokenspeed package ----------
 WORKDIR /opt/app-root/src
-
 COPY python/pyproject.toml python/LICENSE python/THIRDPARTYNOTICES ./python/
 COPY python/tokenspeed ./python/tokenspeed
 
 RUN cd python \
-    && python3 -m pip install --no-cache-dir --no-deps --no-build-isolation . \
-    && find /usr -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
+    && pip install --no-cache-dir --no-deps --no-build-isolation .
+
+# ---------- Strip caches / tests from venv to shrink copy size ----------
+RUN find ${VIRTUAL_ENV} -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
+    && find ${VIRTUAL_ENV} -type d -name 'tests' -path '*/torch/*' -exec rm -rf {} + 2>/dev/null || true \
+    && find ${VIRTUAL_ENV} -type d -name '*.dist-info' -exec sh -c 'rm -rf "$1"/RECORD "$1"/SOURCES.txt "$1"/top_level.txt 2>/dev/null' _ {} \; 2>/dev/null || true \
     && rm -rf /root/.cache /tmp/pip-*
 
-# ---------- Light verification (no torch import to avoid CUDA init artefacts) ----------
+
+# ========================  STAGE 2: Runtime  ========================
+FROM nvcr.io/nvidia/cuda:12.6.3-runtime-ubi9
+
+USER 0
+
+# Minimal runtime system packages (no compiler toolchain)
+RUN dnf install -y \
+        python3.12 \
+        libibverbs \
+        librdmacm \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf /var/cache/yum \
+    && alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
+
+# Copy the entire virtual environment from the builder
+ENV VIRTUAL_ENV=/opt/venv
+COPY --from=builder ${VIRTUAL_ENV} ${VIRTUAL_ENV}
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+# Copy application source
+WORKDIR /opt/app-root/src
+COPY --from=builder /opt/app-root/src/python ./python
+
+# ---------- Light verification (no torch import — avoids CUDA init) ----------
 RUN python3 -c "import uvicorn; import fastapi; print('Server deps OK')" \
     && python3 -c "from tokenspeed.version import __version__; print(f'TokenSpeed v{__version__}')"
 
@@ -124,7 +150,7 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 # ---------- OpenShift compatibility ----------
-# Create writable cache directory; set group-0 permissions for arbitrary UID
+# Writable cache dir; group-0 perms for arbitrary UID
 RUN mkdir -p /opt/app-root/src/.cache/huggingface \
     && chgrp -R 0 /opt/app-root \
     && chmod -R g=u /opt/app-root
@@ -133,7 +159,7 @@ EXPOSE 8000
 
 USER 1001
 
-# Use shell form so environment variables are expanded at runtime
+# Shell form so env vars are expanded at runtime
 CMD exec python3 -m tokenspeed.cli serve \
     --model ${TOKENSPEED_MODEL} \
     --host ${TOKENSPEED_HOST} \
