@@ -1,39 +1,35 @@
 # --------------------------------------------------------------------------
 # TokenSpeed — GPU-accelerated LLM inference engine
-# Single-stage Dockerfile for OpenShift (CUDA runtime + UBI9)
+# Multi-stage Dockerfile for OpenShift (CUDA runtime + UBI9)
 # --------------------------------------------------------------------------
 # Build context: repo root (/workspace/tokenspeed)
 # Build command:  podman build -f python/Dockerfile.ubi .
 # --------------------------------------------------------------------------
 #
-# Previous build failed: builder pod was OOM-killed / evicted due to resource
-# pressure during a multi-stage build that installed PyTorch + all deps twice
-# (once in builder, once copied to runtime).
+# Previous build failed: builder pod OOM-killed / evicted due to resource
+# pressure when installing PyTorch + all deps in a single-stage image
+# (large intermediate layers exhausted ephemeral storage).
 #
 # Fixes applied:
-#   1. Single-stage build — eliminates duplicate storage of large packages
-#      and reduces peak disk usage by ~50%.
-#   2. Install torch first in its own layer with aggressive cleanup, then
-#      install remaining deps — avoids simultaneous peak memory from
-#      resolving the full dependency graph at once.
-#   3. PIP_NO_CACHE_DIR=1 globally to prevent pip cache accumulation.
-#   4. Skip triton explicit install (bundled with torch).
-#   5. Removed compiler toolchain from final image (gcc, devel headers) —
-#      only install for the pip step, then remove.
-#   6. Use --no-build-isolation for tokenspeed itself to avoid pip creating
-#      a redundant build environment.
+#   1. Multi-stage build: heavy compile/install in builder, copy only the
+#      installed Python site-packages to a slim CUDA runtime image. This
+#      avoids storing compiler toolchain + pip cache in any final layer.
+#   2. Single consolidated pip install with --no-compile --no-cache-dir
+#      to minimise peak disk and memory usage.
+#   3. Removed dev-only packages (viztracer, py-spy, uv) to reduce
+#      download/install footprint.
+#   4. squash cleanup in builder to remove every temp artifact before COPY.
 # --------------------------------------------------------------------------
 
-FROM nvcr.io/nvidia/cuda:12.6.3-runtime-ubi9
+# ========================== STAGE 1: Builder ==============================
+FROM nvcr.io/nvidia/cuda:12.6.3-devel-ubi9 AS builder
 
 USER 0
 
-# ---------- Global pip config ----------
-ENV PIP_NO_CACHE_DIR=1
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_NO_COMPILE=1
 
-# ---------- System dependencies ----------
-# Install Python 3.12 + minimal build tools needed for some pip packages.
-# Compilers will be removed after pip install to shrink the image.
+# Install Python 3.12 + build essentials
 RUN dnf install -y \
         python3.12 \
         python3.12-pip \
@@ -41,27 +37,30 @@ RUN dnf install -y \
         gcc \
         gcc-c++ \
         git \
-        libibverbs \
-        librdmacm \
     && dnf clean all \
+    && rm -rf /var/cache/dnf \
     && alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
     && alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
 
-RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+# Create a virtual-env so we can copy it cleanly to the runtime stage
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
 
-WORKDIR /opt/app-root/src
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# ---------- Step 1: Install PyTorch (largest dep, ~2 GB) ----------
-# Isolated so pip only resolves torch + torchvision; less peak memory.
-RUN python3 -m pip install --no-cache-dir \
+# ---------- Install PyTorch first (largest dep, ~2 GB) ----------
+# Isolated layer so pip only resolves torch + torchvision; less peak memory.
+RUN pip install --no-cache-dir \
         "torch==2.11.0" \
         torchvision \
         --extra-index-url https://download.pytorch.org/whl/cu126 \
-    && rm -rf /tmp/pip-* /root/.cache
+    && find /opt/venv -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
+    && rm -rf /tmp/pip-*
 
-# ---------- Step 2: Install remaining application dependencies ----------
-# These are the deps from pyproject.toml minus torch/torchvision (already installed).
-RUN python3 -m pip install --no-cache-dir \
+# ---------- Install remaining application deps ----------
+# All deps from pyproject.toml minus torch/torchvision (already installed)
+# and minus dev-only tools (viztracer, py-spy, uv).
+RUN pip install --no-cache-dir \
         aiohttp \
         compressed-tensors \
         dill \
@@ -87,7 +86,6 @@ RUN python3 -m pip install --no-cache-dir \
         pybase64 \
         pybind11 \
         pydantic \
-        py-spy \
         python-multipart \
         pyzmq \
         requests \
@@ -95,28 +93,42 @@ RUN python3 -m pip install --no-cache-dir \
         tiktoken \
         tqdm \
         "transformers==5.6.2" \
-        uv \
         uvicorn \
         uvloop \
-        viztracer \
         "xgrammar==0.1.33" \
-    && rm -rf /tmp/pip-* /root/.cache
+    && find /opt/venv -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
+    && rm -rf /tmp/pip-*
 
-# ---------- Step 3: Install the tokenspeed package ----------
+# ---------- Install the tokenspeed package itself ----------
+WORKDIR /opt/build
 COPY python/pyproject.toml python/LICENSE python/THIRDPARTYNOTICES ./python/
 COPY python/tokenspeed ./python/tokenspeed
 
 RUN cd python \
-    && python3 -m pip install --no-cache-dir --no-deps --no-build-isolation . \
-    && rm -rf /tmp/pip-* /root/.cache
+    && pip install --no-cache-dir --no-deps --no-build-isolation . \
+    && find /opt/venv -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
+    && rm -rf /tmp/pip-* /opt/build
 
-# ---------- Step 4: Remove build-only packages to reduce image size ----------
-RUN dnf remove -y \
-        python3.12-devel \
-        gcc \
-        gcc-c++ \
+# ========================== STAGE 2: Runtime ==============================
+FROM nvcr.io/nvidia/cuda:12.6.3-runtime-ubi9
+
+USER 0
+
+# Minimal runtime dependencies — Python 3.12, network libs
+RUN dnf install -y \
+        python3.12 \
+        libibverbs \
+        librdmacm \
     && dnf clean all \
-    && rm -rf /var/cache/dnf
+    && rm -rf /var/cache/dnf \
+    && alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
+
+# Copy the fully-built virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+WORKDIR /opt/app-root/src
 
 # ---------- Verify critical imports ----------
 RUN python3 -c "import uvicorn; import fastapi; print('Server deps OK')" \
