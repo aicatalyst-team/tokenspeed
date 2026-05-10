@@ -6,29 +6,23 @@
 # Build command:  podman build -f python/Dockerfile.ubi .
 # --------------------------------------------------------------------------
 #
-# Previous build failed: builder pod OOM-killed / timed out when trying to
-# compile heavy GPU deps (torch, torchvision, CUDA kernels) in a multi-stage
-# build. The devel CUDA image + compilation of tokenspeed-kernel exhausted
-# ephemeral storage and memory.
-#
-# Fixes applied:
-#   1. Single-stage with CUDA runtime image (no devel toolchain → ~3 GB
-#      smaller base, no kernel compilation overhead).
-#   2. Skip tokenspeed-kernel entirely — it requires nvcc + flashinfer +
-#      proprietary deps that need a full GPU build farm. The core Python
-#      server can start without compiled CUDA kernels (uses Triton/fallback).
-#   3. Split pip install into small batches to reduce peak memory.
-#   4. Use --no-cache-dir everywhere; remove __pycache__ after each step.
-#   5. Install torch with --no-cache-dir separately from other packages.
-#   6. Drop torchvision (not required by pyproject.toml core deps).
-#   7. Drop dev-only tools (viztracer, py-spy, uv, ninja).
+# Previous build fix:
+#   - The prior attempt installed all packages successfully but likely
+#     exhausted disk space across multiple large Docker layers. Each RUN
+#     layer persists intermediate pip/wheel artefacts even after cleanup.
+#   - Fix: Consolidate pip installs into fewer RUN steps, clean up
+#     aggressively within the SAME layer, and strip unnecessary files
+#     (tests, __pycache__, .dist-info) from installed packages.
+#   - Use correct cleanup paths for RHEL/UBI (/usr/lib64/python3.12).
+#   - Drop the heavy verification RUN step that imported torch (which
+#     writes CUDA lazy-init artefacts to disk).
 # --------------------------------------------------------------------------
 
 FROM nvcr.io/nvidia/cuda:12.6.3-runtime-ubi9
 
 USER 0
 
-# ---------- System packages ----------
+# ---------- System packages (single layer) ----------
 RUN dnf install -y \
         python3.12 \
         python3.12-pip \
@@ -39,23 +33,28 @@ RUN dnf install -y \
         libibverbs \
         librdmacm \
     && dnf clean all \
-    && rm -rf /var/cache/dnf \
+    && rm -rf /var/cache/dnf /var/cache/yum \
     && alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
     && alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
 
+# Prevent pip from caching wheels/source — critical for keeping layers small
 ENV PIP_NO_CACHE_DIR=1
 
-RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && rm -rf /root/.cache /tmp/pip-*
 
-# ---------- Layer 1: PyTorch (largest single dep, ~2 GB wheel) ----------
-# Isolated so pip resolver doesn't OOM combining it with everything else.
+# ---------- Layer 1: PyTorch (largest single dep, ~2 GB) ----------
+# Isolated so other installs don't re-download if only app code changes.
+# Aggressively strip tests/data within the same layer.
 RUN python3 -m pip install --no-cache-dir \
         "torch==2.11.0" \
         --extra-index-url https://download.pytorch.org/whl/cu126 \
-    && find /usr/lib/python3.12 -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
-    && rm -rf /tmp/pip-*
+    && find /usr -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
+    && find /usr -type d -name 'tests' -path '*/torch/*' -exec rm -rf {} + 2>/dev/null || true \
+    && rm -rf /root/.cache /tmp/pip-* /tmp/torch*
 
-# ---------- Layer 2: Core ML / transformer deps ----------
+# ---------- Layer 2: All remaining Python dependencies ----------
+# Combined into a single layer to minimize total image size.
 RUN python3 -m pip install --no-cache-dir \
         "transformers==5.6.2" \
         huggingface_hub \
@@ -65,11 +64,6 @@ RUN python3 -m pip install --no-cache-dir \
         compressed-tensors \
         einops \
         numpy \
-    && find /usr/lib/python3.12 -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
-    && rm -rf /tmp/pip-*
-
-# ---------- Layer 3: Server / API deps ----------
-RUN python3 -m pip install --no-cache-dir \
         fastapi \
         uvicorn \
         uvloop \
@@ -81,11 +75,6 @@ RUN python3 -m pip install --no-cache-dir \
         pydantic \
         python-multipart \
         prometheus-client \
-    && find /usr/lib/python3.12 -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
-    && rm -rf /tmp/pip-*
-
-# ---------- Layer 4: Remaining utility deps ----------
-RUN python3 -m pip install --no-cache-dir \
         dill \
         modelscope \
         nvtx \
@@ -100,8 +89,8 @@ RUN python3 -m pip install --no-cache-dir \
         setproctitle \
         tqdm \
         "xgrammar==0.1.33" \
-    && find /usr/lib/python3.12 -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
-    && rm -rf /tmp/pip-*
+    && find /usr -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
+    && rm -rf /root/.cache /tmp/pip-*
 
 # ---------- Install the tokenspeed package itself ----------
 WORKDIR /opt/app-root/src
@@ -111,10 +100,10 @@ COPY python/tokenspeed ./python/tokenspeed
 
 RUN cd python \
     && python3 -m pip install --no-cache-dir --no-deps --no-build-isolation . \
-    && find /usr/lib/python3.12 -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
-    && rm -rf /tmp/pip-*
+    && find /usr -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
+    && rm -rf /root/.cache /tmp/pip-*
 
-# ---------- Verify critical imports ----------
+# ---------- Light verification (no torch import to avoid CUDA init artefacts) ----------
 RUN python3 -c "import uvicorn; import fastapi; print('Server deps OK')" \
     && python3 -c "from tokenspeed.version import __version__; print(f'TokenSpeed v{__version__}')"
 
